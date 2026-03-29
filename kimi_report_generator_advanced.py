@@ -661,51 +661,46 @@ class KimiAPIAgent:
         return combined
 
     def _generate_report_code(self, template_style: dict, content: str, config: ReportConfig) -> str:
-        """第3轮：生成报告代码"""
-        import requests
+        """第3轮：生成报告代码（精简版，避免超时）"""
         import json
         
         print("[INFO] 请求 AI 生成排版代码...")
+        print("[INFO] 提示：代码生成可能需要 1-3 分钟，请耐心等待...")
         
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": "kimi-k2.5",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个专业的文档自动化专家。请输出可执行的 Python 代码，使用 ReportLab 生成 PDF。"
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"""请生成 Python 代码，创建专业的 PDF 报告。
+        # 精简内容，避免超时
+        content_limit = 4000
+        if len(content) > content_limit:
+            print(f"[INFO] 内容较长 ({len(content)} 字符)，截取前 {content_limit} 字符生成")
+            content = content[:content_limit]
+        
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一个专业的文档自动化专家。请输出简洁的 Python 代码，使用 ReportLab 生成 PDF。代码要精简实用。"
+            },
+            {
+                "role": "user", 
+                "content": f"""请生成 Python 代码，创建 PDF 报告。
 
 【版式规范】
-{json.dumps(template_style, ensure_ascii=False, indent=2)}
+{json.dumps(template_style, ensure_ascii=False)}
 
 【报告内容】
-{content[:6000]}
+{content}
 
 【输出要求】
 1. 使用 reportlab 库
-2. 严格遵循版式规范中的颜色、字体、边距
-3. 中文字体使用系统自带的 SimHei 或 Microsoft YaHei
-4. 添加页眉页脚（如规范中有定义）
-5. 保存文件到: {config.output_file}
-6. 代码必须完整可执行，包含所有 import
-7. 内容较多时自动分页，确保布局美观
-8. **重要**：reportlab.lib.units 中没有 pt，只用 mm/cm/inch，字号直接用数字
+2. 中文字体使用 SimHei 或 Microsoft YaHei（系统自带）
+3. units 只用 mm/cm/inch，不要用 pt
+4. 保存到: {config.output_file}
+5. 代码简洁完整，能直接运行
 
-只输出 Python 代码，不要有其他说明。"""
-                    }
-                ],
-                "temperature": 1
+只输出 Python 代码。"""
             }
-        )
-
-        result = response.json()
-        self._check_api_response(result)
+        ]
+        
+        # 使用带重试的机制，但给更长超时
+        result = self._api_call_with_retry(messages, max_retries=3, timeout=180)
         
         code = result['choices'][0]['message']['content']
 
@@ -803,8 +798,9 @@ class KimiAPIAgent:
                 
             except requests.exceptions.ConnectionError as e:
                 last_error = f"连接错误: {e}"
-                wait_time = min(3 * (attempt + 1), 30)
+                wait_time = min(5 * (attempt + 1), 60)  # 增加等待时间
                 self._log(f"尝试 {attempt + 1} 连接错误，{wait_time}秒后重试...", "WARN")
+                self._log(f"错误详情: {str(e)[:100]}", "DEBUG")
                 time.sleep(wait_time)
                 
             except RuntimeError as e:
@@ -819,9 +815,18 @@ class KimiAPIAgent:
                     raise  # 其他 RuntimeError 直接抛出
                 
             except Exception as e:
-                last_error = f"未知错误: {e}"
-                self._log(f"尝试 {attempt + 1} 失败: {e}", "ERROR")
-                time.sleep(1)
+                error_str = str(e)
+                # 检查是否是 RemoteDisconnected 或其他连接问题
+                if 'remotedisconnected' in error_str.lower() or 'connection aborted' in error_str.lower():
+                    last_error = f"连接被中断: {e}"
+                    wait_time = min(10 * (attempt + 1), 60)
+                    self._log(f"尝试 {attempt + 1} 连接被服务器中断，{wait_time}秒后重试...", "WARN")
+                    self._log(f"这可能是由于请求处理时间过长，正在缩短内容重试...", "WARN")
+                    time.sleep(wait_time)
+                else:
+                    last_error = f"未知错误: {e}"
+                    self._log(f"尝试 {attempt + 1} 失败: {e}", "ERROR")
+                    time.sleep(1)
         
         # 所有重试都失败
         raise RuntimeError(f"API 调用在 {max_retries} 次尝试后失败: {last_error}")
