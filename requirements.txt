@@ -1,0 +1,10 @@
+# Kimi Agent Report Generator 依赖
+
+# 核心依赖 - API 模式必需
+requests>=2.28.0
+
+# 可选依赖 - 用于本地 PDF 生成
+# reportlab>=3.6.0
+
+# 可选依赖 - 用于 Word 文档生成  
+# python-docx>=0.8.11
