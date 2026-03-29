@@ -34,6 +34,10 @@ python kimi_report_generator_advanced.py template.pdf report.pdf -o output.pdf -
 - ✅ **多格式输出**：PDF、Word (DOCX)、PPT、Excel
 - ✅ **智能图表**：保留原报告中的表格和数据描述
 - ✅ **批量处理**：支持命令行参数和 Python API 调用
+- ✅ **多轮分治**：超长内容自动分块处理，避免 API 超时
+- ✅ **并行加速**：默认 8 线程并行处理多个报告
+- ✅ **智能重试**：网络错误自动重试，指数退避策略
+- ✅ **调试模式**：详细日志输出，便于问题诊断
 
 ## 🛠️ 命令行参数
 
@@ -70,6 +74,63 @@ python setup_github.py
 git remote add origin https://github.com/yunfeiz/auto_report.git
 git branch -M main
 git push -u origin main
+```
+
+## 🔧 故障排除
+
+### API 超时 / Connection aborted
+
+如果遇到 `RemoteDisconnected` 或连接超时错误，可以尝试：
+
+```bash
+# 1. 启用调试模式查看详细日志
+python kimi_report_generator_advanced.py template.pdf --reports 20260319/ --debug
+
+# 2. 减少并行度（降低 API 压力）
+python kimi_report_generator_advanced.py template.pdf --reports 20260319/ -w 4
+
+# 3. 单次处理更少文件
+python kimi_report_generator_advanced.py template.pdf report1.pdf report2.pdf -o output.pdf
+
+# 4. 检查网络连接，或稍后重试
+```
+
+### 内存不足
+
+批量处理大量 PDF 时可能内存不足：
+
+```python
+# Python API 方式：分批处理
+from kimi_report_generator_advanced import generate_report
+
+pdf_files = [...]  # 100个文件
+batch_size = 10
+
+for i in range(0, len(pdf_files), batch_size):
+    batch = pdf_files[i:i+batch_size]
+    generate_report(
+        template="template.pdf",
+        content=batch[0],
+        content_pdfs=batch,
+        output=f"report_batch_{i}.pdf",
+        max_workers=4  # 降低并行度
+    )
+```
+
+### Debug 模式输出示例
+
+```
+[DEBUG] 开始上传模板文件: template.pdf
+[DEBUG] 模板文件上传成功, file_id: abc123
+[DEBUG] 模板内容获取成功, 长度: 7388 字符
+[INFO] 版式规范提取完成
+[DEBUG] ===== 第2轮：提取报告内容 =====
+[INFO] 并行处理 17 个文件 (线程数: 8)...
+[DEBUG] [1/17] 开始处理: 恒泰期货_尿素日报.pdf
+[DEBUG] [1/17] 文件上传成功, file_id: def456
+[DEBUG] [1/17] 内容超长 (15800), 启用分块处理
+[DEBUG] [1/17] 内容已分为 6 块
+...
 ```
 
 ## 💻 Python API 使用
