@@ -267,7 +267,7 @@ class KimiAPIAgent:
     3. 汇总生成最终报告
     """
 
-    def __init__(self, api_key: Optional[str] = None, max_workers: int = 3):
+    def __init__(self, api_key: Optional[str] = None, max_workers: int = 8, debug: bool = False):
         # 优先级：构造函数参数 > 环境变量 > 本地配置文件
         self.api_key = api_key or os.getenv("KIMI_API_KEY") or _load_api_key_from_file()
         if not self.api_key:
@@ -280,6 +280,12 @@ class KimiAPIAgent:
 
         self.base_url = "https://api.moonshot.cn/v1"
         self.max_workers = max_workers  # 并行处理的最大线程数
+        self.debug = debug  # 调试模式
+        
+    def _log(self, message: str, level: str = "INFO"):
+        """打印调试日志"""
+        if self.debug or level in ["ERROR", "WARN"]:
+            print(f"[{level}] {message}")
 
     def generate(self, config: ReportConfig) -> str:
         """
@@ -322,29 +328,35 @@ class KimiAPIAgent:
 
     def _extract_template_style(self, template_pdf: str) -> dict:
         """第1轮：提取模板版式规范"""
-        import requests
+        import json
+        
+        self._log(f"开始上传模板文件: {template_pdf}", "DEBUG")
         
         # 上传并获取模板内容
         template_id = self._upload_file(template_pdf)
+        self._log(f"模板文件上传成功, file_id: {template_id}", "DEBUG")
+        
         template_text = self._get_file_content(template_id)
+        self._log(f"模板内容获取成功, 长度: {len(template_text)} 字符", "DEBUG")
+        
+        # 如果内容太长，分段处理
+        content_limit = 3000
+        if len(template_text) > content_limit:
+            self._log(f"模板内容较长 ({len(template_text)}), 截取前 {content_limit} 字符分析", "DEBUG")
+            template_text = template_text[:content_limit]
         
         # 请求 AI 提取版式规范（结构化输出）
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": "kimi-k2.5",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个专业的文档设计分析师。请分析模板PDF并提取版式规范，以JSON格式输出。"
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"""分析以下PDF模板，提取版式规范。
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一个专业的文档设计分析师。请分析模板PDF并提取版式规范，以JSON格式输出。"
+            },
+            {
+                "role": "user", 
+                "content": f"""分析以下PDF模板，提取版式规范。
 
-模板内容：
-{template_text[:3000]}
+模板内容（前{content_limit}字符）：
+{template_text}
 
 请以JSON格式输出以下信息：
 {{
@@ -358,23 +370,22 @@ class KimiAPIAgent:
 }}
 
 只输出JSON，不要有其他说明。"""
-                    }
-                ],
-                "temperature": 1
             }
-        )
-
-        result = response.json()
-        self._check_api_response(result)
+        ]
+        
+        self._log("请求 AI 分析模板版式...", "DEBUG")
+        result = self._api_call_with_retry(messages, max_retries=3, timeout=60)
         
         content = result['choices'][0]['message']['content']
+        self._log(f"AI 响应内容长度: {len(content)} 字符", "DEBUG")
         
         # 提取 JSON
         try:
             # 尝试直接解析
-            import json
             style = json.loads(content)
-        except json.JSONDecodeError:
+            self._log("JSON 解析成功", "DEBUG")
+        except json.JSONDecodeError as e:
+            self._log(f"直接 JSON 解析失败: {e}, 尝试从代码块提取", "WARN")
             # 从代码块中提取
             if "```json" in content:
                 json_str = content.split("```json")[1].split("```")[0].strip()
@@ -383,6 +394,7 @@ class KimiAPIAgent:
             else:
                 json_str = content.strip()
             style = json.loads(json_str)
+            self._log("从代码块提取 JSON 成功", "DEBUG")
         
         return style
 
@@ -420,30 +432,35 @@ class KimiAPIAgent:
 
     def _extract_report_summary(self, pdf_path: str, idx: int, total: int) -> str:
         """提取单份报告的核心内容摘要"""
-        import requests
+        self._log(f"[{idx}/{total}] 开始处理: {os.path.basename(pdf_path)}", "DEBUG")
         
-        # 上传文件
-        file_id = self._upload_file(pdf_path)
-        content_text = self._get_file_content(file_id)
-        
-        # 如果内容较短，直接返回
-        if len(content_text) < 2000:
-            return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n\n{content_text}"
-        
-        # 长内容需要摘要提取
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": "kimi-k2.5",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个专业的金融分析师。请提取报告的核心内容，保留关键数据、观点和结论。"
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"""请提取以下研究报告的核心内容摘要。
+        try:
+            # 上传文件
+            file_id = self._upload_file(pdf_path)
+            self._log(f"[{idx}/{total}] 文件上传成功, file_id: {file_id}", "DEBUG")
+            
+            content_text = self._get_file_content(file_id)
+            self._log(f"[{idx}/{total}] 内容获取成功, 长度: {len(content_text)} 字符", "DEBUG")
+            
+            # 如果内容较短，直接返回
+            if len(content_text) < 1500:
+                self._log(f"[{idx}/{total}] 内容较短，直接返回", "DEBUG")
+                return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n\n{content_text}"
+            
+            # 如果内容超长，需要分段处理
+            if len(content_text) > 4000:
+                self._log(f"[{idx}/{total}] 内容超长 ({len(content_text)}), 启用分块处理", "WARN")
+                return self._extract_summary_chunked(pdf_path, content_text, idx, total)
+            
+            # 长内容需要摘要提取
+            messages = [
+                {
+                    "role": "system",
+                    "content": "你是一个专业的金融分析师。请提取报告的核心内容，保留关键数据、观点和结论。"
+                },
+                {
+                    "role": "user", 
+                    "content": f"""请提取以下研究报告的核心内容摘要。
 
 要求：
 1. 保留报告标题、日期、机构名称
@@ -456,17 +473,110 @@ class KimiAPIAgent:
 {content_text[:4000]}
 
 请输出结构化的摘要："""
-                    }
-                ],
-                "temperature": 1
-            }
-        )
+                }
+            ]
+            
+            self._log(f"[{idx}/{total}] 请求 AI 提取摘要...", "DEBUG")
+            result = self._api_call_with_retry(messages, max_retries=3, timeout=90)
+            
+            summary = result['choices'][0]['message']['content']
+            self._log(f"[{idx}/{total}] 摘要提取完成, 长度: {len(summary)} 字符", "DEBUG")
+            
+            return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n\n{summary}"
+            
+        except Exception as e:
+            self._log(f"[{idx}/{total}] 处理失败: {e}", "ERROR")
+            return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n[提取失败: {str(e)[:100]}]\n"
 
-        result = response.json()
-        self._check_api_response(result)
+    def _extract_summary_chunked(self, pdf_path: str, content_text: str, idx: int, total: int) -> str:
+        """
+        分段提取超长内容的摘要
         
-        summary = result['choices'][0]['message']['content']
-        return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n\n{summary}"
+        策略：
+        1. 将内容分成多个块（每块约3000字符）
+        2. 分别提取每个块的关键信息
+        3. 合并所有块的关键信息生成最终摘要
+        """
+        self._log(f"[{idx}/{total}] 分块处理开始, 总长度: {len(content_text)}", "DEBUG")
+        
+        chunk_size = 3000
+        chunks = []
+        
+        # 将内容分块（尽量在段落边界分割）
+        for i in range(0, len(content_text), chunk_size):
+            chunk = content_text[i:i+chunk_size]
+            chunks.append(chunk)
+        
+        self._log(f"[{idx}/{total}] 内容已分为 {len(chunks)} 块", "DEBUG")
+        
+        # 提取每个块的关键信息
+        chunk_summaries = []
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            self._log(f"[{idx}/{total}] 处理第 {chunk_idx}/{len(chunks)} 块...", "DEBUG")
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": "你是一个专业的金融分析师。请提取这段内容的关键信息。"
+                },
+                {
+                    "role": "user", 
+                    "content": f"""请提取以下内容的关键信息（第 {chunk_idx}/{len(chunks)} 部分）：
+
+{chunk}
+
+请提取：
+1. 关键数据和数字
+2. 重要观点和结论
+3. 机构名称、日期等元数据（如果是第一部分）
+
+控制在300字以内。"""
+                }
+            ]
+            
+            try:
+                result = self._api_call_with_retry(messages, max_retries=2, timeout=60)
+                chunk_summary = result['choices'][0]['message']['content']
+                chunk_summaries.append(chunk_summary)
+                self._log(f"[{idx}/{total}] 第 {chunk_idx} 块处理完成", "DEBUG")
+            except Exception as e:
+                self._log(f"[{idx}/{total}] 第 {chunk_idx} 块处理失败: {e}", "WARN")
+                chunk_summaries.append(f"[第 {chunk_idx} 块提取失败]")
+        
+        # 合并所有块的摘要
+        self._log(f"[{idx}/{total}] 合并 {len(chunk_summaries)} 个块摘要...", "DEBUG")
+        
+        combined_chunks = "\n\n".join(chunk_summaries)
+        
+        # 最终摘要生成
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一个专业的金融分析师。请基于多个片段生成一份连贯的摘要。"
+            },
+            {
+                "role": "user", 
+                "content": f"""请基于以下各部分内容，生成一份完整的研究报告摘要。
+
+各部分内容：
+{combined_chunks}
+
+要求：
+1. 整合所有信息，生成连贯的摘要
+2. 保留关键数据、观点和结论
+3. 控制在800字以内
+4. 保持专业报告的语言风格
+
+请输出结构化摘要："""
+            }
+        ]
+        
+        result = self._api_call_with_retry(messages, max_retries=2, timeout=90)
+        final_summary = result['choices'][0]['message']['content']
+        
+        self._log(f"[{idx}/{total}] 分块处理完成, 最终摘要长度: {len(final_summary)} 字符", "DEBUG")
+        
+        return f"\n\n===== 报告 [{idx}/{total}]：{os.path.basename(pdf_path)} =====\n\n{final_summary}"
 
     def _merge_summaries(self, summaries: list) -> str:
         """合并所有报告摘要，生成执行摘要"""
@@ -580,6 +690,65 @@ class KimiAPIAgent:
         if 'choices' not in result:
             raise RuntimeError(f"API 响应格式错误: {result}")
 
+    def _api_call_with_retry(self, messages: list, max_retries: int = 3, timeout: int = 120) -> dict:
+        """
+        带重试机制的 API 调用
+        
+        Args:
+            messages: 消息列表
+            max_retries: 最大重试次数
+            timeout: 超时时间（秒）
+            
+        Returns:
+            API 响应结果
+        """
+        import requests
+        import time
+        
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                self._log(f"API 调用尝试 {attempt + 1}/{max_retries}", "DEBUG")
+                
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": "kimi-k2.5",
+                        "messages": messages,
+                        "temperature": 1
+                    },
+                    timeout=timeout
+                )
+                
+                self._log(f"API 响应状态: {response.status_code}", "DEBUG")
+                
+                result = response.json()
+                self._check_api_response(result)
+                
+                self._log(f"API 调用成功", "DEBUG")
+                return result
+                
+            except requests.exceptions.Timeout as e:
+                last_error = f"请求超时: {e}"
+                self._log(f"尝试 {attempt + 1} 超时，{2 ** attempt}秒后重试...", "WARN")
+                time.sleep(2 ** attempt)  # 指数退避
+                
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"连接错误: {e}"
+                self._log(f"尝试 {attempt + 1} 连接错误: {e}", "WARN")
+                # 连接错误可能是网络问题，短暂等待后重试
+                time.sleep(3)
+                
+            except Exception as e:
+                last_error = f"未知错误: {e}"
+                self._log(f"尝试 {attempt + 1} 失败: {e}", "ERROR")
+                time.sleep(1)
+        
+        # 所有重试都失败
+        raise RuntimeError(f"API 调用在 {max_retries} 次尝试后失败: {last_error}")
+
     def _upload_file(self, file_path: str) -> str:
         """上传文件"""
         import requests
@@ -616,7 +785,8 @@ def generate_report(
     output: str = "output.pdf",
     mode: Literal["auto", "cli", "api"] = "api",
     reports_folder: str = None,
-    max_workers: int = 3,
+    max_workers: int = 8,
+    debug: bool = False,
     **kwargs
 ) -> str:
     """
@@ -628,7 +798,8 @@ def generate_report(
         output: 输出文件路径
         mode: 生成模式（auto=自动选择，cli=本地Agent，api=云端API，默认: api）
         reports_folder: 报告文件夹路径（批量模式，与 content 二选一）
-        max_workers: API 模式下并行处理的线程数（默认: 3）
+        max_workers: API 模式下并行处理的线程数（默认: 8）
+        debug: 是否启用详细调试输出（默认: False）
         **kwargs: 其他配置（company_name, title 等）
 
     Returns:
@@ -676,7 +847,7 @@ def generate_report(
     if mode == "cli":
         agent = KimiCLIAgent()
     else:
-        agent = KimiAPIAgent(max_workers=max_workers)
+        agent = KimiAPIAgent(max_workers=max_workers, debug=debug)
 
     return agent.generate(config)
 
@@ -726,8 +897,10 @@ if __name__ == "__main__":
                        help="报告标题（覆盖自动提取）")
     parser.add_argument("--reports", dest="reports_folder", default=None,
                        help="报告文件夹路径（批量模式，读取该目录下所有 PDF 生成综合报告）")
-    parser.add_argument("-w", "--workers", type=int, default=3,
-                       help="API 模式下并行处理的线程数（默认: 3）")
+    parser.add_argument("-w", "--workers", type=int, default=8,
+                       help="API 模式下并行处理的线程数（默认: 8）")
+    parser.add_argument("--debug", action="store_true",
+                       help="启用详细调试输出")
 
     args = parser.parse_args()
 
@@ -749,6 +922,7 @@ if __name__ == "__main__":
             mode=args.mode,
             reports_folder=args.reports_folder,
             max_workers=args.workers,
+            debug=args.debug,
             company_name=args.company,
             title=args.title
         )
