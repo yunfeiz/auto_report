@@ -267,7 +267,9 @@ class KimiAPIAgent:
     3. 汇总生成最终报告
     """
 
-    def __init__(self, api_key: Optional[str] = None, max_workers: int = 8, debug: bool = False):
+    def __init__(self, api_key: Optional[str] = None, max_workers: int = 3, debug: bool = False):
+        # 限制最大并发数（Moonshot API 限制为 3）
+        max_workers = min(max_workers, 3)
         # 优先级：构造函数参数 > 环境变量 > 本地配置文件
         self.api_key = api_key or os.getenv("KIMI_API_KEY") or _load_api_key_from_file()
         if not self.api_key:
@@ -399,34 +401,67 @@ class KimiAPIAgent:
         return style
 
     def _extract_summaries_parallel(self, pdf_paths: list) -> list:
-        """并行提取多份报告的核心内容"""
+        """并行提取多份报告的核心内容（使用信号量限制并发）"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        import time
         
         summaries = []
         total = len(pdf_paths)
         
-        print(f"[INFO] 并行处理 {total} 个文件 (线程数: {self.max_workers})...")
+        # 使用信号量限制 API 并发数（最大 3，符合 API 限制）
+        api_semaphore = threading.Semaphore(self.max_workers)
+        completed_count = 0
+        completed_lock = threading.Lock()
+        last_start_time = [0]  # 记录最后一次 API 调用时间
+        time_lock = threading.Lock()
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交所有任务
-            future_to_idx = {
-                executor.submit(self._extract_report_summary, pdf_path, idx + 1, total): idx 
-                for idx, pdf_path in enumerate(pdf_paths)
-            }
+        print(f"[INFO] 并行处理 {total} 个文件 (最大并发: {self.max_workers}, 受 API 限制)...")
+        
+        def process_with_semaphore(pdf_path, idx, total):
+            """带信号量的处理函数（带速率限制）"""
+            nonlocal completed_count
             
-            # 收集结果
-            results = [None] * total
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+            with api_semaphore:
+                # 速率限制：确保每个请求间隔至少 0.5 秒
+                with time_lock:
+                    elapsed = time.time() - last_start_time[0]
+                    if elapsed < 0.5:
+                        sleep_time = 0.5 - elapsed
+                        self._log(f"速率限制：等待 {sleep_time:.2f} 秒", "DEBUG")
+                        time.sleep(sleep_time)
+                    last_start_time[0] = time.time()
+                
+                self._log(f"获取 API 槽位，开始处理 [{idx}/{total}]", "DEBUG")
                 try:
-                    summary = future.result()
-                    results[idx] = summary
-                    print(f"[OK] [{idx+1}/{total}] {os.path.basename(pdf_paths[idx])[:40]}... 处理完成")
+                    result = self._extract_report_summary(pdf_path, idx, total)
+                    
+                    with completed_lock:
+                        completed_count += 1
+                        current = completed_count
+                    
+                    print(f"[OK] [{current}/{total}] {os.path.basename(pdf_path)[:40]}... 处理完成")
+                    return result
+                    
                 except Exception as e:
-                    print(f"[ERROR] [{idx+1}/{total}] 处理失败: {e}")
-                    results[idx] = f"\n\n===== 报告 [{idx+1}] =====\n[提取失败: {e}]\n"
+                    with completed_lock:
+                        completed_count += 1
+                        current = completed_count
+                    
+                    print(f"[ERROR] [{current}/{total}] {os.path.basename(pdf_path)[:40]}... 失败: {str(e)[:50]}")
+                    return f"\n\n===== 报告 [{idx}] =====\n[提取失败: {str(e)[:100]}]\n"
+                finally:
+                    self._log(f"释放 API 槽位 [{idx}/{total}]", "DEBUG")
+        
+        with ThreadPoolExecutor(max_workers=total) as executor:  # 线程池可以大，但信号量限制实际并发
+            # 提交所有任务
+            futures = [
+                executor.submit(process_with_semaphore, pdf_path, idx + 1, total)
+                for idx, pdf_path in enumerate(pdf_paths)
+            ]
             
-            summaries = results
+            # 收集结果（保持顺序）
+            summaries = [future.result() for future in futures]
         
         return summaries
 
@@ -690,9 +725,9 @@ class KimiAPIAgent:
         if 'choices' not in result:
             raise RuntimeError(f"API 响应格式错误: {result}")
 
-    def _api_call_with_retry(self, messages: list, max_retries: int = 3, timeout: int = 120) -> dict:
+    def _api_call_with_retry(self, messages: list, max_retries: int = 5, timeout: int = 120) -> dict:
         """
-        带重试机制的 API 调用
+        带重试机制的 API 调用（支持并发限制重试）
         
         Args:
             messages: 消息列表
@@ -724,6 +759,35 @@ class KimiAPIAgent:
                 
                 self._log(f"API 响应状态: {response.status_code}", "DEBUG")
                 
+                # 检查 HTTP 错误状态
+                if response.status_code == 429:
+                    # 并发限制错误
+                    error_data = response.json() if response.text else {}
+                    error_msg = error_data.get('error', {}).get('message', 'Rate limited')
+                    
+                    # 尝试从错误信息中提取等待时间
+                    wait_time = 2  # 默认等待 2 秒
+                    if 'try again after' in error_msg.lower():
+                        try:
+                            # 解析 "try again after X seconds"
+                            import re
+                            match = re.search(r'after\s+(\d+)\s+seconds', error_msg.lower())
+                            if match:
+                                wait_time = int(match.group(1)) + 1  # 多等 1 秒确保
+                        except:
+                            pass
+                    
+                    wait_time = wait_time * (attempt + 1)  # 递增等待
+                    self._log(f"并发限制 (429): {error_msg}", "WARN")
+                    self._log(f"等待 {wait_time} 秒后重试...", "WARN")
+                    time.sleep(wait_time)
+                    continue  # 继续下一次重试
+                
+                # 其他 HTTP 错误
+                if response.status_code != 200:
+                    error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
+                    raise RuntimeError(f"API HTTP 错误: {error_msg}")
+                
                 result = response.json()
                 self._check_api_response(result)
                 
@@ -732,14 +796,26 @@ class KimiAPIAgent:
                 
             except requests.exceptions.Timeout as e:
                 last_error = f"请求超时: {e}"
-                self._log(f"尝试 {attempt + 1} 超时，{2 ** attempt}秒后重试...", "WARN")
-                time.sleep(2 ** attempt)  # 指数退避
+                wait_time = min(2 ** attempt, 30)  # 最大等待 30 秒
+                self._log(f"尝试 {attempt + 1} 超时，{wait_time}秒后重试...", "WARN")
+                time.sleep(wait_time)
                 
             except requests.exceptions.ConnectionError as e:
                 last_error = f"连接错误: {e}"
-                self._log(f"尝试 {attempt + 1} 连接错误: {e}", "WARN")
-                # 连接错误可能是网络问题，短暂等待后重试
-                time.sleep(3)
+                wait_time = min(3 * (attempt + 1), 30)
+                self._log(f"尝试 {attempt + 1} 连接错误，{wait_time}秒后重试...", "WARN")
+                time.sleep(wait_time)
+                
+            except RuntimeError as e:
+                # 检查是否是并发限制错误
+                error_str = str(e)
+                if 'concurrency' in error_str.lower() or 'max organization' in error_str.lower():
+                    wait_time = 2 * (attempt + 1)
+                    self._log(f"并发限制错误，等待 {wait_time} 秒后重试...", "WARN")
+                    time.sleep(wait_time)
+                    last_error = error_str
+                else:
+                    raise  # 其他 RuntimeError 直接抛出
                 
             except Exception as e:
                 last_error = f"未知错误: {e}"
@@ -785,7 +861,7 @@ def generate_report(
     output: str = "output.pdf",
     mode: Literal["auto", "cli", "api"] = "api",
     reports_folder: str = None,
-    max_workers: int = 8,
+    max_workers: int = 3,
     debug: bool = False,
     **kwargs
 ) -> str:
@@ -798,13 +874,15 @@ def generate_report(
         output: 输出文件路径
         mode: 生成模式（auto=自动选择，cli=本地Agent，api=云端API，默认: api）
         reports_folder: 报告文件夹路径（批量模式，与 content 二选一）
-        max_workers: API 模式下并行处理的线程数（默认: 8）
+        max_workers: API 模式下并行处理的线程数（默认: 3，最大 3，受 API 并发限制）
         debug: 是否启用详细调试输出（默认: False）
         **kwargs: 其他配置（company_name, title 等）
 
     Returns:
         生成的文件路径
     """
+    # 限制最大并发数（API 限制）
+    max_workers = min(max_workers, 3)
     # 处理批量报告文件夹
     content_pdfs = None
     if reports_folder:
@@ -897,8 +975,8 @@ if __name__ == "__main__":
                        help="报告标题（覆盖自动提取）")
     parser.add_argument("--reports", dest="reports_folder", default=None,
                        help="报告文件夹路径（批量模式，读取该目录下所有 PDF 生成综合报告）")
-    parser.add_argument("-w", "--workers", type=int, default=8,
-                       help="API 模式下并行处理的线程数（默认: 8）")
+    parser.add_argument("-w", "--workers", type=int, default=3,
+                       help="API 模式下并行处理的线程数（默认: 3，最大 3，受 API 并发限制）")
     parser.add_argument("--debug", action="store_true",
                        help="启用详细调试输出")
 
