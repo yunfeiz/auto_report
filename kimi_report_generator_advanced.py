@@ -695,6 +695,7 @@ class KimiAPIAgent:
 5. 保存文件到: {config.output_file}
 6. 代码必须完整可执行，包含所有 import
 7. 内容较多时自动分页，确保布局美观
+8. **重要**：reportlab.lib.units 中没有 pt，只用 mm/cm/inch，字号直接用数字
 
 只输出 Python 代码，不要有其他说明。"""
                     }
@@ -725,7 +726,7 @@ class KimiAPIAgent:
         if 'choices' not in result:
             raise RuntimeError(f"API 响应格式错误: {result}")
 
-    def _api_call_with_retry(self, messages: list, max_retries: int = 5, timeout: int = 120) -> dict:
+    def _api_call_with_retry(self, messages: list, max_retries: int = 10, timeout: int = 120) -> dict:
         """
         带重试机制的 API 调用（支持并发限制重试）
         
@@ -766,18 +767,18 @@ class KimiAPIAgent:
                     error_msg = error_data.get('error', {}).get('message', 'Rate limited')
                     
                     # 尝试从错误信息中提取等待时间
-                    wait_time = 2  # 默认等待 2 秒
+                    wait_time = 3  # 默认等待 3 秒
                     if 'try again after' in error_msg.lower():
                         try:
                             # 解析 "try again after X seconds"
                             import re
                             match = re.search(r'after\s+(\d+)\s+seconds', error_msg.lower())
                             if match:
-                                wait_time = int(match.group(1)) + 1  # 多等 1 秒确保
+                                wait_time = int(match.group(1)) + 2  # 多等 2 秒确保
                         except:
                             pass
                     
-                    wait_time = wait_time * (attempt + 1)  # 递增等待
+                    wait_time = wait_time + attempt * 2  # 递增等待
                     self._log(f"并发限制 (429): {error_msg}", "WARN")
                     self._log(f"等待 {wait_time} 秒后重试...", "WARN")
                     time.sleep(wait_time)
@@ -883,8 +884,11 @@ def generate_report(
     """
     # 限制最大并发数（API 限制）
     max_workers = min(max_workers, 3)
-    # 处理批量报告文件夹
-    content_pdfs = None
+    
+    # 从 kwargs 获取已传递的 content_pdfs
+    content_pdfs = kwargs.pop('content_pdfs', None)
+    
+    # 处理批量报告文件夹（优先使用 reports_folder）
     if reports_folder:
         reports_folder = Path(reports_folder)
         if not reports_folder.exists():
